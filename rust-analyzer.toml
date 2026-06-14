@@ -1,0 +1,4 @@
+[cargo]
+# Run build scripts so that OUT_DIR is populated and generated proto code
+# (from tonic::include_proto!) is available to the language server.
+buildScripts.enable = true

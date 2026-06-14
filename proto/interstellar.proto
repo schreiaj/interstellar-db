@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package interstellar;
+
+import "google/protobuf/any.proto";
+
+service InterstellarDb {
+  // Store an arbitrary protobuf payload at a 4-D spatio-temporal point.
+  rpc Store(StoreRequest) returns (StoreResponse);
+
+  // Query a single epoch: return all payloads within a spatial bounding sphere
+  // centred on (center_x, center_y, center_z) with given radius at the epoch
+  // that contains timestamp_secs.
+  rpc Query(QueryRequest) returns (stream QueryResponse);
+
+  // Query a time window: return all payloads within the spatial sphere across
+  // every epoch that overlaps [start_secs, end_secs].
+  rpc QueryWindow(QueryWindowRequest) returns (stream QueryResponse);
+
+  // Subscribe to a region: the server streams a QueryResponse for every
+  // subsequent Store that lands inside the sphere.  The stream stays open
+  // until the client cancels it.
+  rpc Subscribe(SubscribeRequest) returns (stream QueryResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+message StoreRequest {
+  double x              = 1;
+  double y              = 2;
+  double z              = 3;
+  uint64 timestamp_secs  = 4;
+  uint64 timestamp_nanos = 5;
+  google.protobuf.Any payload = 6;
+}
+
+message StoreResponse {
+  // The 20-byte spatio-temporal key that was generated for this entry.
+  bytes key = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Query (single epoch)
+// ---------------------------------------------------------------------------
+
+message QueryRequest {
+  double center_x       = 1;
+  double center_y       = 2;
+  double center_z       = 3;
+  double radius         = 4;
+  uint64 timestamp_secs  = 5;
+}
+
+// ---------------------------------------------------------------------------
+// QueryWindow (time range)
+// ---------------------------------------------------------------------------
+
+message QueryWindowRequest {
+  double center_x  = 1;
+  double center_y  = 2;
+  double center_z  = 3;
+  double radius    = 4;
+  uint64 start_secs = 5;
+  uint64 end_secs   = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Subscribe
+// ---------------------------------------------------------------------------
+
+message SubscribeRequest {
+  double center_x = 1;
+  double center_y = 2;
+  double center_z = 3;
+  double radius   = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Example payload — demonstrates packing an arbitrary struct into Any
+// ---------------------------------------------------------------------------
+
+message EntityState {
+  string entity_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Shared streaming response
+// ---------------------------------------------------------------------------
+
+message QueryResponse {
+  bytes  key             = 1;
+  double x               = 2;
+  double y               = 3;
+  double z               = 4;
+  uint64 timestamp_secs   = 5;
+  uint64 timestamp_nanos  = 6;
+  google.protobuf.Any payload = 7;
+}
