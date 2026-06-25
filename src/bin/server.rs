@@ -9,8 +9,7 @@ use tonic::{transport::Server, Request, Response, Status};
 
 use interstellar_db::interstellar::{
     interstellar_db_server::{InterstellarDb, InterstellarDbServer},
-    QueryRequest, QueryResponse, QueryWindowRequest, StoreRequest, StoreResponse,
-    SubscribeRequest,
+    QueryResponse, QueryWindowRequest, StoreRequest, StoreResponse, SubscribeRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,34 +121,6 @@ impl InterstellarDb for Svc {
         }
 
         Ok(Response::new(StoreResponse { key: key.to_vec() }))
-    }
-
-    // ── Query (single epoch) ─────────────────────────────────────────────────
-
-    type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
-
-    async fn query(
-        &self,
-        request: Request<QueryRequest>,
-    ) -> Result<Response<Self::QueryStream>, Status> {
-        let store = Arc::clone(&self.store);
-        let req = request.into_inner();
-        let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                store.query_epoch(req.center_x, req.center_y, req.center_z, req.radius, req.timestamp_secs)
-            }).await;
-            match result {
-                Ok(Ok(items)) => {
-                    for item in items {
-                        if tx.send(Ok(obs_to_response(item))).await.is_err() { break; }
-                    }
-                }
-                Ok(Err(e)) => { let _ = tx.send(Err(internal(e))).await; }
-                Err(e) => { let _ = tx.send(Err(Status::internal(e.to_string()))).await; }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     // ── QueryWindow (time range) ─────────────────────────────────────────────

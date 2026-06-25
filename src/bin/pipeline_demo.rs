@@ -73,9 +73,13 @@ async fn main() {
     let now_secs: u64 = 10_800; // 3 h elapsed; track went silent at t = 4800 s
 
     // ── Mode 1: fresh epoch scan around last known position ──────────────────
+    // Scope the window to the single epoch that contains `now_secs`.
+    const EPOCH_SECS: u64 = 3600;
+    let epoch_start = (now_secs / EPOCH_SECS) * EPOCH_SECS;
+    let epoch_end = epoch_start + EPOCH_SECS - 1;
     println!("=== Mode 1: single-epoch update (t = {now_secs} s) ===");
     let fresh = store
-        .query_epoch(45.0, 13.5, 5.2, 20.0, now_secs)
+        .query_window(45.0, 13.5, 5.2, 20.0, epoch_start, epoch_end)
         .expect("query epoch");
     println!("  {} observation(s) in current epoch", fresh.len());
     if fresh.is_empty() {

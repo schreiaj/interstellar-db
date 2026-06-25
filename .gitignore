@@ -1,3 +1,6 @@
 /target
 /.direnv
 *.db
+
+# generated wasm bindings
+/web/pkg

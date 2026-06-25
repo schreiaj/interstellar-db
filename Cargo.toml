@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/interstellar-index", "crates/interstellar-wasm"]
+
 [package]
 name = "interstellar_db"
 version = "0.1.0"
@@ -24,6 +27,7 @@ name = "bench"
 path = "src/bin/bench.rs"
 
 [dependencies]
+interstellar-index = { path = "crates/interstellar-index" }
 surrealkv = "0.21.2"
 tokio = { version = "1", features = ["full"] }
 tonic = "0.14.6"

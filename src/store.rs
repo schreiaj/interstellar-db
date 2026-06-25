@@ -83,26 +83,6 @@ impl SpatioTemporalStore {
         Ok(key)
     }
 
-    /// Return all observations within a sphere that fall in the epoch
-    /// containing `timestamp_secs`.
-    ///
-    /// No per-second time pinning: every record in the epoch that passes the
-    /// sphere test is returned.
-    pub fn query_epoch(
-        &self,
-        center_x: f64,
-        center_y: f64,
-        center_z: f64,
-        radius: f64,
-        timestamp_secs: u64,
-    ) -> Result<Vec<Observation>, BoxError> {
-        let depth = self.indexer.calculate_optimal_depth(radius);
-        let ranges = self.indexer.get_boundary_protected_ranges(
-            center_x, center_y, center_z, radius, timestamp_secs, depth,
-        );
-        self.collect(&ranges, center_x, center_y, center_z, radius, 0, u64::MAX)
-    }
-
     /// Return all observations within a sphere across `[start_secs, end_secs]`.
     pub fn query_window(
         &self,

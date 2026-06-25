@@ -18,6 +18,7 @@
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+          targets = [ "wasm32-unknown-unknown" ];
         };
       in
       {
@@ -26,6 +27,9 @@
             rustToolchain
             pkgs.cargo-nextest
             pkgs.cargo-watch
+            # WASM toolchain: build the browser bindings and serve the demo.
+            pkgs.wasm-bindgen-cli
+            pkgs.miniserve
           ];
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

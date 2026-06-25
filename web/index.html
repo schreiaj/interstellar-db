@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>interstellar-db · browser (WASM + IndexedDB)</title>
+<!-- deck.gl standalone bundle: exposes window.deck -->
+<script src="https://unpkg.com/deck.gl@^9/dist.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #0b0e14; color: #c8d3f5;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    padding: 16px;
+    gap: 12px;
+    height: 100%;
+  }
+  header { }
+  h1 { font-size: 18px; margin: 0 0 2px; color: #82aaff; }
+  .sub { color: #7a88b8; margin: 0; }
+  .main {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 16px;
+    min-height: 0;
+  }
+  .sidebar { display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+  fieldset { border: 1px solid #2a3350; border-radius: 8px; margin: 0; padding: 10px 12px; }
+  legend { color: #82aaff; padding: 0 6px; }
+  label { display: flex; justify-content: space-between; gap: 8px; margin: 5px 0; align-items: center; }
+  input { width: 110px; background: #11162050; border: 1px solid #2a3350; color: #c8d3f5;
+          border-radius: 5px; padding: 3px 6px; font: inherit; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  button { background: #1b2540; color: #c8d3f5; border: 1px solid #3a4570; border-radius: 6px;
+           padding: 5px 9px; font: inherit; cursor: pointer; }
+  button:hover { background: #25325a; }
+  button.primary { background: #2d4a8a; border-color: #4a6bb0; }
+  .right { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  #deck-container {
+    flex: 1;
+    position: relative;
+    border: 1px solid #2a3350;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #070a10;
+  }
+  #deck-container canvas { display: block; }
+  .hint { position: absolute; bottom: 10px; right: 12px; font-size: 11px; color: #3a4570;
+          pointer-events: none; }
+  .stat { display: flex; gap: 16px; flex-wrap: wrap; color: #9aa7d6; font-size: 13px; flex-shrink: 0; }
+  .stat b { color: #c3e88d; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle;
+         margin-right: 3px; }
+  #log { background: #070a10; border: 1px solid #2a3350; border-radius: 8px; padding: 8px 10px;
+         height: 130px; overflow-y: auto; white-space: pre-wrap; font-size: 12px; color: #8b97c4;
+         flex-shrink: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>interstellar-db <span style="color:#7a88b8">· in the browser</span></h1>
+  <p class="sub">Rust Morton indexer → WASM → Web Worker → IndexedDB. Drag to orbit, scroll to zoom.</p>
+</header>
+
+<div class="main">
+  <div class="sidebar">
+    <fieldset>
+      <legend>store</legend>
+      <label>max range <input id="maxRange" type="number" value="1000" /></label>
+      <label>epoch (s)  <input id="epoch"    type="number" value="3600" /></label>
+      <label>seed pts   <input id="nPoints"  type="number" value="5000" /></label>
+      <label>time span  <input id="timeSpan" type="number" value="10800" /></label>
+      <div class="buttons">
+        <button id="seed" class="primary">Seed</button>
+        <button id="count">Count</button>
+        <button id="clear">Clear DB</button>
+        <button id="selftest">Self-test</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>query</legend>
+      <div class="buttons" style="margin-bottom:8px">
+        <button id="orbitBtn">Orbit demo</button>
+      </div>
+      <label>center x <input id="cx"     type="number" value="0" /></label>
+      <label>center y <input id="cy"     type="number" value="0" /></label>
+      <label>center z <input id="cz"     type="number" value="0" /></label>
+      <label>radius   <input id="radius" type="number" value="250" /></label>
+      <label>epoch t  <input id="secs"   type="number" value="0" /></label>
+      <div class="buttons">
+        <button id="qEpoch" class="primary">Query epoch</button>
+      </div>
+      <label style="margin-top:8px">win start <input id="startSecs" type="number" value="0" /></label>
+      <label>win end   <input id="endSecs"   type="number" value="10800" /></label>
+      <div class="buttons">
+        <button id="qWindow" class="primary">Query window</button>
+      </div>
+    </fieldset>
+
+    <div class="stat">
+      <span><span class="dot" style="background:#3a4570"></span>seeded <b id="sSeeded">0</b></span>
+      <span><span class="dot" style="background:#c3e88d"></span>matched <b id="sMatched">0</b></span>
+      <span>scanned <b id="sScanned">0</b></span>
+      <span>ranges <b id="sRanges">0</b></span>
+      <span>time <b id="sTime">–</b></span>
+    </div>
+  </div>
+
+  <div class="right">
+    <div id="deck-container">
+      <span class="hint">drag · scroll · right-drag pan</span>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const log = (m) => { const el = $('log'); el.textContent += m + '\n'; el.scrollTop = el.scrollHeight; };
+
+// ---- Worker RPC -----------------------------------------------------------
+const worker = new Worker('./worker.js', { type: 'module' });
+let nextId = 1;
+const pending = new Map();
+worker.onmessage = (e) => {
+  const { id, ok, result, error } = e.data;
+  const p = pending.get(id);
+  if (!p) return;
+  pending.delete(id);
+  ok ? p.resolve(result) : p.reject(new Error(error));
+};
+const rpc = (op, args) => new Promise((resolve, reject) => {
+  const id = nextId++;
+  pending.set(id, { resolve, reject });
+  worker.postMessage({ id, op, args });
+});
+
+// ---- deck.gl setup --------------------------------------------------------
+const { Deck, OrbitView, ScatterplotLayer, PathLayer } = window.deck;
+
+// OrbitView target (center of scene) and zoom that fits ±maxRange in view.
+function initialViewState(R = 1000) {
+  return {
+    target: [0, 0, 0],
+    rotationX: 30,
+    rotationOrbit: -30,
+    zoom: Math.log2(400 / R), // ~400px visible half-extent
+    minZoom: -8,
+    maxZoom: 8,
+  };
+}
+
+const deckInstance = new Deck({
+  parent: $('deck-container'),
+  views: new OrbitView({ orbitAxis: 'Y' }),
+  controller: true,
+  initialViewState: initialViewState(),
+  layers: [],
+  // Transparent background so CSS background (#070a10) shows through.
+  style: { width: '100%', height: '100%' },
+  parameters: { clearColor: [0.027, 0.039, 0.063, 1] },
+});
+
+// Build three great-circle paths (xy, xz, yz planes) to sketch a sphere.
+function sphereCircles(cx, cy, cz, r, N = 72) {
+  const pts = (fn) => Array.from({ length: N + 1 }, (_, i) => fn((i / N) * 2 * Math.PI));
+  return [
+    pts((a) => [cx + r * Math.cos(a), cy + r * Math.sin(a), cz]),
+    pts((a) => [cx + r * Math.cos(a), cy,                    cz + r * Math.sin(a)]),
+    pts((a) => [cx,                    cy + r * Math.cos(a),  cz + r * Math.sin(a)]),
+  ];
+}
+
+// ---- State ----------------------------------------------------------------
+let seeded = [];
+let matched = [];
+let lastQuery = null; // { cx, cy, cz, radius }
+
+function redraw() {
+  const layers = [];
+
+  if (seeded.length > 0) {
+    layers.push(new ScatterplotLayer({
+      id: 'backdrop',
+      data: seeded,
+      getPosition: (d) => [d.x, d.y, d.z],
+      getFillColor: [58, 69, 112, 90],
+      getRadius: 2.5,
+      radiusUnits: 'pixels',
+    }));
+  }
+
+  if (lastQuery) {
+    const { cx, cy, cz, radius } = lastQuery;
+    layers.push(new PathLayer({
+      id: 'sphere',
+      data: sphereCircles(cx, cy, cz, radius),
+      getPath: (d) => d,
+      getColor: [130, 170, 255, 200],
+      getWidth: 1.5,
+      widthUnits: 'pixels',
+    }));
+    // Mark the query center.
+    layers.push(new ScatterplotLayer({
+      id: 'center',
+      data: [{ x: cx, y: cy, z: cz }],
+      getPosition: (d) => [d.x, d.y, d.z],
+      getFillColor: [130, 170, 255, 255],
+      getRadius: 5,
+      radiusUnits: 'pixels',
+    }));
+  }
+
+  if (matched.length > 0) {
+    layers.push(new ScatterplotLayer({
+      id: 'matched',
+      data: matched,
+      getPosition: (d) => [d.x, d.y, d.z],
+      getFillColor: [195, 232, 141, 255],
+      getRadius: 5,
+      radiusUnits: 'pixels',
+    }));
+  }
+
+  deckInstance.setProps({ layers });
+}
+
+redraw();
+
+// ---- Actions --------------------------------------------------------------
+function maxRange() { return Number($('maxRange').value); }
+
+async function applyConfig() {
+  await rpc('config', { maxRange: maxRange(), epochDuration: Number($('epoch').value) });
+}
+
+$('seed').onclick = async () => {
+  stopOrbit();
+  await applyConfig();
+  const n = Number($('nPoints').value), R = maxRange(), span = Number($('timeSpan').value);
+  $('seed').disabled = true;
+  $('seed').textContent = 'Seeding…';
+  const t = performance.now();
+  try {
+    const recs = Array.from({ length: n }, (_, i) => ({
+      x: (Math.random() * 2 - 1) * R,
+      y: (Math.random() * 2 - 1) * R,
+      z: (Math.random() * 2 - 1) * R,
+      secs: Math.floor(Math.random() * span),
+      label: `e${i}`,
+    }));
+    // 10k-record chunks: ~10× fewer IDB transactions than the original 1k
+    // chunks, which is the main bottleneck for large datasets.
+    for (let i = 0; i < recs.length; i += 10_000) {
+      await rpc('store', { records: recs.slice(i, i + 10_000) });
+    }
+    seeded = recs; matched = []; lastQuery = null;
+    deckInstance.setProps({ initialViewState: initialViewState(R) });
+    redraw();
+    $('sSeeded').textContent = recs.length;
+    log(`seeded ${recs.length} pts in ${(performance.now() - t).toFixed(0)} ms`);
+    await refreshCount();
+  } catch (err) {
+    log(`seed error: ${err.message}`);
+  } finally {
+    $('seed').disabled = false;
+    $('seed').textContent = 'Seed';
+  }
+};
+
+async function runQuery(kind, overrides = {}) {
+  const cx = overrides.cx ?? Number($('cx').value);
+  const cy = overrides.cy ?? Number($('cy').value);
+  const cz = overrides.cz ?? Number($('cz').value);
+  const radius = Number($('radius').value);
+  const t = performance.now();
+  let res;
+  if (kind === 'epoch') {
+    res = await rpc('queryEpoch', { cx, cy, cz, radius, secs: Number($('secs').value) });
+  } else {
+    res = await rpc('queryWindow', {
+      cx, cy, cz, radius,
+      startSecs: Number($('startSecs').value), endSecs: Number($('endSecs').value),
+    });
+  }
+  const ms = performance.now() - t;
+  matched = res.results; lastQuery = { cx, cy, cz, radius }; redraw();
+  $('cx').value = cx.toFixed(1); $('cy').value = cy.toFixed(1); $('cz').value = cz.toFixed(1);
+  $('sMatched').textContent = res.results.length;
+  $('sScanned').textContent = res.scanned;
+  $('sRanges').textContent = res.ranges;
+  $('sTime').textContent = ms.toFixed(1) + ' ms';
+  return { ms, res };
+}
+$('qEpoch').onclick = () => { stopOrbit(); runQuery('epoch').then(({ ms, res }) =>
+  log(`epoch: ${res.results.length} hits / ${res.scanned} scanned / ${res.ranges} ranges · ${ms.toFixed(1)} ms`)); };
+$('qWindow').onclick = () => { stopOrbit(); runQuery('window').then(({ ms, res }) =>
+  log(`window: ${res.results.length} hits / ${res.scanned} scanned / ${res.ranges} ranges · ${ms.toFixed(1)} ms`)); };
+
+// ---- Orbit demo -----------------------------------------------------------
+// The query center traces a Lissajous curve through 3D space so every part of
+// the dataset gets swept. Each iteration awaits the worker reply, so the loop
+// rate is naturally capped by query throughput — the stat line shows live ms.
+let orbitActive = false;
+let orbitT0 = 0;
+
+function stopOrbit() {
+  if (!orbitActive) return;
+  orbitActive = false;
+  $('orbitBtn').textContent = 'Orbit demo';
+  $('orbitBtn').classList.remove('primary');
+}
+
+async function orbitLoop() {
+  while (orbitActive) {
+    const t = (performance.now() - orbitT0) / 1000; // seconds since start
+    const R = maxRange() * 0.4;                      // orbit within 40% of range
+    const cx = R * Math.cos(t * 0.8);
+    const cy = R * Math.sin(t * 0.5);
+    const cz = R * Math.sin(t * 1.1);
+
+    const { ms, res } = await runQuery('window', { cx, cy, cz });
+    $('sTime').textContent = ms.toFixed(1) + ' ms';
+
+    // Yield to the browser for a paint before the next query.
+    await new Promise((r) => requestAnimationFrame(r));
+  }
+}
+
+$('orbitBtn').onclick = () => {
+  if (orbitActive) {
+    stopOrbit();
+  } else {
+    orbitActive = true;
+    orbitT0 = performance.now();
+    $('orbitBtn').textContent = 'Stop orbit';
+    $('orbitBtn').classList.add('primary');
+    orbitLoop();
+  }
+};
+
+// ---- Utilities ------------------------------------------------------------
+async function refreshCount() {
+  const { count } = await rpc('count');
+  log(`db holds ${count} observations`);
+}
+$('count').onclick = refreshCount;
+
+$('clear').onclick = async () => {
+  stopOrbit();
+  await rpc('clear'); seeded = []; matched = []; lastQuery = null; redraw();
+  $('sSeeded').textContent = '0'; $('sMatched').textContent = '0';
+  log('cleared db');
+};
+
+$('selftest').onclick = async () => {
+  stopOrbit();
+  await applyConfig();
+  const P = { x: 123.5, y: -456.25, z: 789.0, secs: 4242, label: 'selftest-probe' };
+  await rpc('store', { records: [P] });
+  const near = await rpc('queryWindow',
+    { cx: P.x, cy: P.y, cz: P.z, radius: 5, startSecs: P.secs, endSecs: P.secs });
+  const hit = near.results.find((r) => r.label === 'selftest-probe');
+  const far = await rpc('queryWindow',
+    { cx: -P.x, cy: -P.y, cz: -P.z, radius: 5, startSecs: P.secs, endSecs: P.secs });
+  const farHit = far.results.some((r) => r.label === 'selftest-probe');
+  const tol = maxRange() / (1 << 21) + 1e-9;
+  const okCoords = hit && Math.abs(hit.x - P.x) <= tol
+    && Math.abs(hit.y - P.y) <= tol && Math.abs(hit.z - P.z) <= tol;
+  const pass = !!hit && !!okCoords && hit.secs === P.secs && !farHit;
+  log(`self-test: ${pass ? 'PASS ✓' : 'FAIL ✗'} [found=${!!hit} coords=${!!okCoords} time=${hit?.secs === P.secs} far-excluded=${!farHit}]`);
+  if (hit) log(`  decoded (${hit.x.toFixed(3)}, ${hit.y.toFixed(3)}, ${hit.z.toFixed(3)}) @ ${hit.secs}s`);
+};
+
+log('ready — seed data, then query or hit Orbit demo. Drag to orbit camera, scroll to zoom.');
+</script>
+</body>
+</html>

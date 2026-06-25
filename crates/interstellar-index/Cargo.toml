@@ -1,0 +1,11 @@
+[package]
+name = "interstellar-index"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "interstellar_index"
+path = "src/lib.rs"
+
+[dev-dependencies]
+approx = "0.5"

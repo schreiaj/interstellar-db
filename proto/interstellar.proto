@@ -8,11 +8,6 @@ service InterstellarDb {
   // Store an arbitrary protobuf payload at a 4-D spatio-temporal point.
   rpc Store(StoreRequest) returns (StoreResponse);
 
-  // Query a single epoch: return all payloads within a spatial bounding sphere
-  // centred on (center_x, center_y, center_z) with given radius at the epoch
-  // that contains timestamp_secs.
-  rpc Query(QueryRequest) returns (stream QueryResponse);
-
   // Query a time window: return all payloads within the spatial sphere across
   // every epoch that overlaps [start_secs, end_secs].
   rpc QueryWindow(QueryWindowRequest) returns (stream QueryResponse);
@@ -39,18 +34,6 @@ message StoreRequest {
 message StoreResponse {
   // The 20-byte spatio-temporal key that was generated for this entry.
   bytes key = 1;
-}
-
-// ---------------------------------------------------------------------------
-// Query (single epoch)
-// ---------------------------------------------------------------------------
-
-message QueryRequest {
-  double center_x       = 1;
-  double center_y       = 2;
-  double center_z       = 3;
-  double radius         = 4;
-  uint64 timestamp_secs  = 5;
 }
 
 // ---------------------------------------------------------------------------

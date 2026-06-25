@@ -1,0 +1,16 @@
+[package]
+name = "interstellar-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "interstellar_wasm"
+# cdylib -> the .wasm artifact; rlib -> usable as a normal Rust dep/test target.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+interstellar-index = { path = "../interstellar-index" }
+# Pinned to the wasm-bindgen-cli version provided by the dev shell (flake.nix).
+wasm-bindgen = "=0.2.121"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
