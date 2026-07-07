@@ -7,6 +7,9 @@ consensus round on the write path — convergence comes from anti-entropy sync
 over a Merkle octree built on the same Morton-coded keys the store already
 uses.
 
+For a scripted end-to-end tour — three nodes, writes on two of them reaching
+a subscriber on the third — run `cargo run --bin mesh_demo`.
+
 ## Quick start: a two-node mesh
 
 Each node needs its own database path and port, and a list of peers to pull

@@ -26,6 +26,10 @@ path = "src/bin/parabola_demo.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "mesh_demo"
+path = "src/bin/mesh_demo.rs"
+
 [dependencies]
 interstellar-index = { path = "crates/interstellar-index" }
 surrealkv = "0.21.2"

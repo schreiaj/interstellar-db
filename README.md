@@ -68,6 +68,7 @@ interprets the bytes you hand it.
 | `docs/MESH.md`                   | Running a multi-node mesh: setup, semantics, tuning.                |
 | `src/bin/pipeline_demo.rs`       | Kalman-style pipeline: single-epoch vs. time-window queries.        |
 | `src/bin/parabola_demo.rs`       | End-to-end demo: stores a trajectory and subscribes to pushes.      |
+| `src/bin/mesh_demo.rs`           | 3-node mesh demo: anti-entropy sync + cross-node subscriptions.     |
 | `src/bin/bench.rs`               | Insert / read / subscription-fanout benchmarks at 10k–10M records.  |
 | `web/`                           | Browser demo: WASM indexer in a Web Worker over IndexedDB.          |
 | `proto/interstellar.proto`       | gRPC service and message definitions.                               |
@@ -89,6 +90,9 @@ cargo run --bin server                  # listens on [::1]:50051, ./interstellar
 
 # End-to-end demo (builds and starts the server automatically)
 cargo run --bin parabola_demo
+
+# 3-node mesh demo: writes on two nodes reach a subscriber on the third
+cargo run --bin mesh_demo
 
 # Query-mode pipeline demo
 cargo run --bin pipeline_demo
