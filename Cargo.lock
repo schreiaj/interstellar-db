@@ -592,6 +592,7 @@ name = "interstellar-index"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "sha2",
 ]
 
 [[package]]

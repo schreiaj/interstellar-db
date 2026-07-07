@@ -58,6 +58,12 @@ message SubscribeRequest {
   double center_y = 2;
   double center_z = 3;
   double radius   = 4;
+  // Only deliver observations whose own timestamp is at most this many
+  // seconds old when they arrive at this node. 0 (the default) disables the
+  // filter. Subscriptions fire for anti-entropy sync ingests as well as local
+  // stores, so a reconnecting peer can replay hours of history - set this to
+  // your freshness horizon if you only want live data.
+  uint64 max_age_secs = 5;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,4 +86,63 @@ message QueryResponse {
   uint64 timestamp_secs   = 5;
   uint64 timestamp_nanos  = 6;
   google.protobuf.Any payload = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Anti-entropy sync (Merkle octree)
+//
+// Pull-only: a node converges by diffing a peer's Merkle forest against its
+// own and fetching the rows in divergent leaf cells. Two nodes each pulling
+// from the other converge from both sides. Node hashes are XOR-folds of item
+// digests, so they are comparable at any depth regardless of tree structure.
+// ---------------------------------------------------------------------------
+
+service InterstellarSync {
+  // Per-epoch root hashes — the opening summary of a sync round.
+  rpc Roots(SyncRootsRequest) returns (SyncRootsResponse);
+
+  // The non-empty children (one level deeper) of one tree node.
+  rpc Children(SyncChildrenRequest) returns (SyncChildrenResponse);
+
+  // Raw rows in an inclusive key range (a divergent leaf cell).
+  rpc Fetch(SyncFetchRequest) returns (stream SyncRow);
+}
+
+message SyncRootsRequest {}
+
+message EpochRoot {
+  uint32 epoch = 1;
+  bytes  hash  = 2;  // 16-byte big-endian XOR-fold node hash
+}
+
+message SyncRootsResponse {
+  repeated EpochRoot roots = 1;
+  // This node's Merkle leaf depth; a puller descends to
+  // min(its own leaf depth, this).
+  uint32 leaf_depth_bits = 2;
+}
+
+message SyncChildrenRequest {
+  uint32 epoch      = 1;
+  uint32 depth_bits = 2;  // parent depth; children are returned at depth_bits + 3
+  uint64 prefix     = 3;  // parent Morton prefix (low bits zero)
+}
+
+message ChildHash {
+  uint64 prefix = 1;
+  bytes  hash   = 2;
+}
+
+message SyncChildrenResponse {
+  repeated ChildHash children = 1;
+}
+
+message SyncFetchRequest {
+  bytes start_key = 1;  // inclusive, 20 bytes
+  bytes end_key   = 2;  // inclusive, 20 bytes
+}
+
+message SyncRow {
+  bytes key     = 1;  // 20 bytes, stored verbatim by the receiver
+  bytes payload = 2;  // raw stored bytes
 }

@@ -46,7 +46,11 @@ Defined in [`proto/interstellar.proto`](proto/interstellar.proto):
 |---------------|-----------------------------------------------------------------------------|
 | `Store`       | Store a payload at a 4-D point; returns the generated 20-byte key.           |
 | `QueryWindow` | Stream all payloads within a sphere across every epoch overlapping a window. |
-| `Subscribe`   | Stream every subsequent `Store` that lands inside a sphere, until cancelled. |
+| `Subscribe`   | Stream every observation that lands inside a sphere (local writes *and* mesh sync), until cancelled. An optional `max_age_secs` delivers only observations fresher than the bound — useful to skip history replayed by a reconnecting peer. |
+
+A second service, `InterstellarSync` (`Roots` / `Children` / `Fetch`), serves
+Merkle-tree anti-entropy sync between mesh nodes — see
+[`docs/MESH.md`](docs/MESH.md).
 
 Payloads are `google.protobuf.Any`, so the store stays codec-agnostic — it never
 interprets the bytes you hand it.
@@ -59,7 +63,9 @@ interprets the bytes you hand it.
 | `crates/interstellar-wasm/`      | `wasm-bindgen` browser bindings over the indexer.                   |
 | `src/lib.rs`                     | Native crate root: re-exports the indexer, wires up the store + proto. |
 | `src/store.rs`                   | `SpatioTemporalStore` — SurrealKV-backed persistence and queries.   |
-| `src/bin/server.rs`              | gRPC server exposing the `InterstellarDb` service.                  |
+| `src/sync.rs`                    | Mesh anti-entropy: `SyncService` (gRPC) and the `sync_once` puller. |
+| `src/bin/server.rs`              | gRPC server exposing the `InterstellarDb` + `InterstellarSync` services. |
+| `docs/MESH.md`                   | Running a multi-node mesh: setup, semantics, tuning.                |
 | `src/bin/pipeline_demo.rs`       | Kalman-style pipeline: single-epoch vs. time-window queries.        |
 | `src/bin/parabola_demo.rs`       | End-to-end demo: stores a trajectory and subscribes to pushes.      |
 | `src/bin/bench.rs`               | Insert / read / subscription-fanout benchmarks at 10k–10M records.  |
@@ -93,13 +99,26 @@ cargo run --release --bin bench
 
 ### Server configuration
 
-| Variable  | Default             | Meaning                          |
-|-----------|---------------------|----------------------------------|
-| `DB_PATH` | `./interstellar.db` | On-disk location of the store.   |
-| `PORT`    | `50051`             | gRPC listen port on `[::1]`.     |
+| Variable             | Default             | Meaning                                              |
+|----------------------|---------------------|------------------------------------------------------|
+| `DB_PATH`            | `./interstellar.db` | On-disk location of the store.                       |
+| `PORT`               | `50051`             | gRPC listen port.                                    |
+| `BIND_ADDR`          | `[::1]`             | Listen address; use `[::]`/`0.0.0.0` for a mesh.     |
+| `PEERS`              | *(empty)*           | Comma-separated peer URIs to sync from (mesh mode).  |
+| `SYNC_INTERVAL_SECS` | `30`                | Seconds between anti-entropy pull rounds per peer.   |
 
 The server opens the store with `max_range = 1000.0` and `epoch_duration = 3600`
 (one-hour epochs).
+
+## Running as a mesh
+
+Nodes can form a leaderless mesh: every node accepts writes locally and
+reconciles with reachable peers through pull-based anti-entropy sync over a
+Merkle octree built on the same Morton-coded keys the store indexes with.
+Divergent regions are found by comparing hashes level by level, so sync
+traffic is proportional to what actually differs, and settled epochs are
+sealed so restarts don't rescan history. See
+[`docs/MESH.md`](docs/MESH.md) for setup, semantics, and tuning.
 
 ## Running in the browser (WASM + IndexedDB)
 

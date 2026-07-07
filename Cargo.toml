@@ -34,7 +34,7 @@ tonic = "0.14.6"
 tonic-prost = "0.14.6"
 prost = "0.14"
 prost-types = "0.14"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

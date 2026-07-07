@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 
+pub mod merkle;
+
 #[derive(Debug, Clone)]
 pub struct HybridSpatioTemporalIndexer {
     max_range: f64,

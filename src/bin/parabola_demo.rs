@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             let Ok(response) = sub_client.subscribe(SubscribeRequest {
                 center_x: ZONE_CX, center_y: ZONE_CY, center_z: ZONE_CZ, radius: ZONE_R,
+                max_age_secs: 0,
             }).await else { return };
 
             let mut stream = response.into_inner();

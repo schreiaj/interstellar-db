@@ -1,10 +1,28 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Mutex, RwLock};
 
 use surrealkv::{LSMIterator, Mode, TreeBuilder};
+
+use interstellar_index::merkle::{diff_forests, item_digest, MerkleForest};
 
 use crate::HybridSpatioTemporalIndexer;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// A change notification published on the store's watch channel for every
+/// observation that lands, whether via a local write or a sync ingest.
+#[derive(Debug, Clone)]
+pub struct ObservationEvent {
+    pub key: [u8; 20],
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub timestamp_secs: u64,
+    pub timestamp_nanos: u64,
+    /// Shared so fan-out to many subscribers doesn't copy the payload.
+    pub payload: std::sync::Arc<Vec<u8>>,
+}
 
 /// A decoded observation returned by spatial queries.
 #[derive(Debug, Clone)]
@@ -27,6 +45,78 @@ pub struct Observation {
 pub struct SpatioTemporalStore {
     indexer: HybridSpatioTemporalIndexer,
     tree: surrealkv::Tree,
+    /// In-memory anti-entropy summary of the persisted contents. Rebuilt on
+    /// `open` (from seal records plus a scan of unsealed epochs) and kept in
+    /// lockstep with every write thereafter.
+    merkle: RwLock<MerkleForest>,
+    /// Which epochs currently have a seal record on disk, and which have a
+    /// write between its KV commit and its merkle fold (`inflight`). The
+    /// sealer refuses to seal an epoch with writes in flight, so a seal
+    /// record is only ever written when the in-memory tree exactly matches
+    /// the epoch's persisted data.
+    seal: Mutex<SealState>,
+    /// Serializes all seal-record KV writes/deletes so an unsealing writer
+    /// and the sealer can never interleave their commits.
+    seal_io: tokio::sync::Mutex<()>,
+    /// Change tap: every observation that actually lands (local write or
+    /// effective sync ingest) is published here. Lossy by design — slow or
+    /// absent listeners never block the write path.
+    events: tokio::sync::broadcast::Sender<ObservationEvent>,
+}
+
+#[derive(Default)]
+struct SealState {
+    sealed: HashSet<u32>,
+    inflight: HashMap<u32, usize>,
+}
+
+/// Depth of the Merkle octree leaves: 15 bits = 5 subdivisions per axis
+/// (32³ cells per epoch, sparse). Node hashes are structure-independent, so
+/// peers built with a different depth still diff correctly.
+pub const MERKLE_LEAF_DEPTH_BITS: usize = 15;
+
+/// Key prefix for per-epoch seal records. Seal keys are 6 bytes
+/// (`m!` + epoch u32 BE) — a length no data key can have, so every data path
+/// (which accepts exactly-20-byte keys) skips them automatically.
+const SEAL_KEY_PREFIX: [u8; 2] = *b"m!";
+
+fn seal_key(epoch: u32) -> [u8; 6] {
+    let mut k = [0u8; 6];
+    k[0..2].copy_from_slice(&SEAL_KEY_PREFIX);
+    k[2..6].copy_from_slice(&epoch.to_be_bytes());
+    k
+}
+
+fn key_epoch(key: &[u8; 20]) -> u32 {
+    u32::from_be_bytes(key[0..4].try_into().unwrap())
+}
+
+/// Byte ranges covering all data keys in epochs *not* in `sealed`, for the
+/// rebuild scan on open. Each pair is `(start, exclusive end)`.
+fn unsealed_scan_ranges(sealed: &BTreeSet<u32>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let epoch_start = |e: u32| {
+        let mut k = vec![0u8; 20];
+        k[0..4].copy_from_slice(&e.to_be_bytes());
+        k
+    };
+    let mut ranges = Vec::new();
+    let mut cursor: Option<u32> = Some(0);
+    for &e in sealed {
+        let start = cursor.expect("sealed epochs are sorted and deduped");
+        if e > start {
+            ranges.push((epoch_start(start), epoch_start(e)));
+        }
+        cursor = e.checked_add(1);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    if let Some(start) = cursor {
+        // Tail range to the end of the keyspace (21 bytes of 0xFF sorts after
+        // every 20-byte key).
+        ranges.push((epoch_start(start), vec![0xFFu8; 21]));
+    }
+    ranges
 }
 
 impl SpatioTemporalStore {
@@ -39,10 +129,138 @@ impl SpatioTemporalStore {
         let tree = TreeBuilder::new()
             .with_path(path.as_ref().to_path_buf())
             .build()?;
+
+        // Rebuild the Merkle forest: sealed epochs load from their compact
+        // seal records (no data scan); only unsealed epochs pay a scan. A
+        // seal record is only ever committed while its epoch exactly matches
+        // the in-memory tree, and any later write to that epoch deletes the
+        // record *before* the data commit — so a record present here is
+        // trustworthy even after a crash.
+        let mut forest = MerkleForest::new(MERKLE_LEAF_DEPTH_BITS);
+        let mut sealed = BTreeSet::new();
+        {
+            let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+
+            let mut seal_end = SEAL_KEY_PREFIX.to_vec();
+            *seal_end.last_mut().unwrap() += 1;
+            let mut iter = txn.range(SEAL_KEY_PREFIX.as_slice(), seal_end.as_slice())?;
+            iter.seek_first()?;
+            while iter.valid() {
+                if let Ok(k) = <[u8; 6]>::try_from(iter.key().user_key()) {
+                    let epoch = u32::from_be_bytes(k[2..6].try_into().unwrap());
+                    // An unreadable record (e.g. sealed at a different leaf
+                    // depth) is simply ignored; the epoch falls back to the
+                    // data scan below and gets resealed later.
+                    if forest.load_sealed_epoch(epoch, &iter.value()?).is_ok() {
+                        sealed.insert(epoch);
+                    }
+                }
+                iter.next()?;
+            }
+
+            for (start, end) in unsealed_scan_ranges(&sealed) {
+                let mut iter = txn.range(start.as_slice(), end.as_slice())?;
+                iter.seek_first()?;
+                while iter.valid() {
+                    if let Ok(key) = <[u8; 20]>::try_from(iter.key().user_key()) {
+                        forest.insert(&key, &iter.value()?);
+                    }
+                    iter.next()?;
+                }
+            }
+        }
+
         Ok(Self {
             indexer: HybridSpatioTemporalIndexer::new(max_range, epoch_duration),
             tree,
+            merkle: RwLock::new(forest),
+            seal: Mutex::new(SealState {
+                sealed: sealed.into_iter().collect(),
+                inflight: HashMap::new(),
+            }),
+            seal_io: tokio::sync::Mutex::new(()),
+            events: tokio::sync::broadcast::channel(1024).0,
         })
+    }
+
+    /// Subscribe to every observation that lands in this store, from local
+    /// writes and sync ingests alike. A receiver that falls more than the
+    /// channel capacity behind misses the overflow (`RecvError::Lagged`) —
+    /// consistent with the store's lossy notification semantics.
+    pub fn watch(&self) -> tokio::sync::broadcast::Receiver<ObservationEvent> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, key: &[u8; 20], payload: &[u8]) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        let (x, y, z, secs, nanos) = self.indexer.decode_key(key);
+        let _ = self.events.send(ObservationEvent {
+            key: *key,
+            x,
+            y,
+            z,
+            timestamp_secs: secs,
+            timestamp_nanos: nanos,
+            payload: std::sync::Arc::new(payload.to_vec()),
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-path seal bookkeeping
+    //
+    // Invariant: a seal record on disk exactly matches its epoch's data on
+    // disk. Writers guarantee it by deleting the record in a commit that
+    // lands *before* any new data for that epoch (crash between the two just
+    // costs a rescan on open). The sealer guarantees it by never sealing an
+    // epoch that has a write between its data commit and its merkle fold.
+    // -----------------------------------------------------------------------
+
+    /// Marks a write to `epoch` as in flight, first unsealing it if needed.
+    async fn begin_write_epoch(&self, epoch: u32) -> Result<(), BoxError> {
+        {
+            let mut s = self.seal.lock().unwrap();
+            if !s.sealed.contains(&epoch) {
+                *s.inflight.entry(epoch).or_insert(0) += 1;
+                return Ok(());
+            }
+        }
+        // Sealed epoch: remove its seal record before this write's data can
+        // land. Holding seal_io keeps the sealer (which may be mid-commit on
+        // this very record) from interleaving.
+        let _io = self.seal_io.lock().await;
+        let mut txn = self.tree.begin()?;
+        txn.delete(seal_key(epoch).as_slice())?;
+        txn.commit().await?;
+        let mut s = self.seal.lock().unwrap();
+        s.sealed.remove(&epoch);
+        *s.inflight.entry(epoch).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Marks writes to each (distinct) epoch as in flight; on failure, no
+    /// epoch is left marked.
+    async fn begin_write_epochs(&self, epochs: &[u32]) -> Result<(), BoxError> {
+        for (i, &e) in epochs.iter().enumerate() {
+            if let Err(err) = self.begin_write_epoch(e).await {
+                self.end_write_epochs(&epochs[..i]);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn end_write_epochs(&self, epochs: &[u32]) {
+        let mut s = self.seal.lock().unwrap();
+        for e in epochs {
+            if let Some(n) = s.inflight.get_mut(e) {
+                *n -= 1;
+                if *n == 0 {
+                    s.inflight.remove(e);
+                }
+            }
+        }
     }
 
     /// Write many records in a single transaction.
@@ -53,15 +271,38 @@ impl SpatioTemporalStore {
         &self,
         records: &[(f64, f64, f64, u64, u64, &[u8])], // (x, y, z, secs, nanos, payload)
     ) -> Result<Vec<[u8; 20]>, BoxError> {
-        let mut txn = self.tree.begin()?;
-        let mut keys = Vec::with_capacity(records.len());
-        for &(x, y, z, secs, nanos, payload) in records {
-            let key = self.indexer.generate_key(x, y, z, secs, nanos);
-            txn.set(&key, payload)?;
-            keys.push(key);
+        let keys: Vec<[u8; 20]> = records
+            .iter()
+            .map(|&(x, y, z, secs, nanos, _)| self.indexer.generate_key(x, y, z, secs, nanos))
+            .collect();
+        let epochs: Vec<u32> = keys
+            .iter()
+            .map(key_epoch)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        self.begin_write_epochs(&epochs).await?;
+        let result = async {
+            let mut txn = self.tree.begin()?;
+            for (key, &(.., payload)) in keys.iter().zip(records) {
+                txn.set(key, payload)?;
+            }
+            txn.commit().await?;
+            {
+                let mut forest = self.merkle.write().unwrap();
+                for (key, &(.., payload)) in keys.iter().zip(records) {
+                    forest.insert(key, payload);
+                }
+            }
+            for (key, &(.., payload)) in keys.iter().zip(records) {
+                self.publish(key, payload);
+            }
+            Ok(())
         }
-        txn.commit().await?;
-        Ok(keys)
+        .await;
+        self.end_write_epochs(&epochs);
+        result.map(|()| keys)
     }
 
     /// Store a payload at a 4-D spatio-temporal point.
@@ -77,10 +318,212 @@ impl SpatioTemporalStore {
         payload: &[u8],
     ) -> Result<[u8; 20], BoxError> {
         let key = self.indexer.generate_key(x, y, z, timestamp_secs, timestamp_nanos);
-        let mut txn = self.tree.begin()?;
-        txn.set(&key, payload)?;
-        txn.commit().await?;
-        Ok(key)
+        let epochs = [key_epoch(&key)];
+        self.begin_write_epochs(&epochs).await?;
+        let result = async {
+            let mut txn = self.tree.begin()?;
+            txn.set(&key, payload)?;
+            txn.commit().await?;
+            self.merkle.write().unwrap().insert(&key, payload);
+            self.publish(&key, payload);
+            Ok(())
+        }
+        .await;
+        self.end_write_epochs(&epochs);
+        result.map(|()| key)
+    }
+
+    /// Flush and close the underlying KV tree, releasing its file lock.
+    pub async fn close(&self) -> Result<(), BoxError> {
+        self.tree.close().await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Anti-entropy sync
+    // -----------------------------------------------------------------------
+
+    /// Snapshot of this store's Merkle forest, suitable for shipping to (or
+    /// receiving from) a peer for diffing.
+    pub fn merkle_forest(&self) -> MerkleForest {
+        self.merkle.read().unwrap().clone()
+    }
+
+    /// Root hash per epoch — the opening summary of a sync exchange.
+    pub fn epoch_roots(&self) -> Vec<(u32, u128)> {
+        self.merkle.read().unwrap().epoch_roots()
+    }
+
+    /// Hash of one Merkle node; 0 when empty/absent.
+    pub fn node_hash(&self, epoch: u32, depth_bits: usize, prefix: u64) -> u128 {
+        self.merkle.read().unwrap().node_hash(epoch, depth_bits, prefix)
+    }
+
+    /// The ≤ 8 non-empty children of one Merkle node, one level deeper.
+    pub fn child_hashes(&self, epoch: u32, depth_bits: usize, prefix: u64) -> Vec<(u64, u128)> {
+        self.merkle.read().unwrap().child_hashes(epoch, depth_bits, prefix)
+    }
+
+    /// Key ranges where this store and a peer's forest disagree.
+    ///
+    /// The ranges are symmetric: both sides scan their own rows in each range
+    /// and ship them to the other; idempotent ingest makes over-shipping safe.
+    pub fn sync_plan(&self, remote: &MerkleForest) -> Vec<([u8; 20], [u8; 20])> {
+        diff_forests(&self.merkle.read().unwrap(), remote)
+            .into_iter()
+            .map(|d| (d.start_key, d.end_key))
+            .collect()
+    }
+
+    /// Raw rows in an inclusive key range — the transfer unit of a sync.
+    pub fn scan_range(
+        &self,
+        start: &[u8; 20],
+        end: &[u8; 20],
+    ) -> Result<Vec<([u8; 20], Vec<u8>)>, BoxError> {
+        let txn = self.tree.begin_with_mode(Mode::ReadOnly)?;
+        // Pad the inclusive end to 21 bytes to make it exclusive (see collect).
+        let mut end_excl = [0u8; 21];
+        end_excl[..20].copy_from_slice(end);
+
+        let mut rows = Vec::new();
+        let mut iter = txn.range(start.as_slice(), end_excl.as_slice())?;
+        iter.seek_first()?;
+        while iter.valid() {
+            if let Ok(key) = <[u8; 20]>::try_from(iter.key().user_key()) {
+                rows.push((key, iter.value()?));
+            }
+            iter.next()?;
+        }
+        Ok(rows)
+    }
+
+    /// Merge one replicated row, preserving the CRDT set-union semantics.
+    ///
+    /// The key is written verbatim (never re-derived from decoded coordinates,
+    /// which could drift through quantization). Identical rows are a no-op, so
+    /// re-delivery and over-shipping are safe. If the same key arrives with a
+    /// *different* payload, the payload with the larger item digest wins —
+    /// deterministic on both sides, so peers converge regardless of exchange
+    /// order.
+    ///
+    /// Returns `true` if the store changed.
+    pub async fn ingest(&self, key: [u8; 20], payload: &[u8]) -> Result<bool, BoxError> {
+        let existing = {
+            let txn = self.tree.begin_with_mode(Mode::ReadOnly)?;
+            txn.get(&key)?
+        };
+
+        if let Some(current) = &existing {
+            if current.as_slice() == payload {
+                return Ok(false);
+            }
+            if item_digest(&key, current) >= item_digest(&key, payload) {
+                return Ok(false);
+            }
+        }
+
+        let epochs = [key_epoch(&key)];
+        self.begin_write_epochs(&epochs).await?;
+        let result = async {
+            let mut txn = self.tree.begin()?;
+            txn.set(&key, payload)?;
+            txn.commit().await?;
+
+            {
+                let mut forest = self.merkle.write().unwrap();
+                if let Some(current) = &existing {
+                    forest.remove(&key, current);
+                }
+                forest.insert(&key, payload);
+            }
+            // Only effective changes notify: no-op re-deliveries and losing
+            // conflict payloads returned earlier, so over-shipping during
+            // sync can never double-fire subscribers.
+            self.publish(&key, payload);
+            Ok(())
+        }
+        .await;
+        self.end_write_epochs(&epochs);
+        result.map(|()| true)
+    }
+
+    // -----------------------------------------------------------------------
+    // Epoch sealing
+    // -----------------------------------------------------------------------
+
+    /// Persist a seal record for every epoch that ended more than
+    /// `grace_secs` before `now_secs`, so the next `open` can rebuild those
+    /// epochs' Merkle trees without scanning their data.
+    ///
+    /// `grace_secs` should be the worst-case staleness bound of the mesh —
+    /// how late an observation can still arrive for an old epoch. Sealing is
+    /// purely an optimization: a late write into a sealed epoch just deletes
+    /// the record (see `begin_write_epoch`) and the epoch can be resealed on
+    /// a later call. Returns the epochs newly sealed by this call.
+    pub async fn seal_settled_epochs(
+        &self,
+        now_secs: u64,
+        grace_secs: u64,
+    ) -> Result<Vec<u32>, BoxError> {
+        // Epoch e spans [e·dur, (e+1)·dur); settled once (e+1)·dur ≤ now − grace.
+        let cutoff =
+            now_secs.saturating_sub(grace_secs) / self.indexer.epoch_duration() as u64;
+        let candidates: Vec<u32> = self
+            .merkle
+            .read()
+            .unwrap()
+            .epochs()
+            .into_iter()
+            .filter(|&e| (e as u64) < cutoff)
+            .collect();
+
+        let mut newly_sealed = Vec::new();
+        for epoch in candidates {
+            let _io = self.seal_io.lock().await;
+            {
+                let mut s = self.seal.lock().unwrap();
+                if s.sealed.contains(&epoch) || s.inflight.contains_key(&epoch) {
+                    // Already sealed, or a write is between commit and fold —
+                    // sealing now could snapshot a tree missing that write.
+                    continue;
+                }
+                // Mark before committing the record: writers that arrive from
+                // here on take the slow path and block on seal_io until the
+                // record is durable, then delete it ahead of their data.
+                s.sealed.insert(epoch);
+            }
+
+            let Some(bytes) = self.merkle.read().unwrap().serialize_epoch(epoch) else {
+                self.seal.lock().unwrap().sealed.remove(&epoch);
+                continue;
+            };
+            let commit = async {
+                let mut txn = self.tree.begin()?;
+                txn.set(seal_key(epoch).as_slice(), bytes.as_slice())?;
+                txn.commit().await?;
+                Ok::<(), BoxError>(())
+            }
+            .await;
+            if let Err(err) = commit {
+                self.seal.lock().unwrap().sealed.remove(&epoch);
+                return Err(err);
+            }
+            newly_sealed.push(epoch);
+        }
+        Ok(newly_sealed)
+    }
+
+    /// Epochs currently backed by a seal record, ascending.
+    pub fn sealed_epochs(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.seal.lock().unwrap().sealed.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The macro-epoch duration in seconds this store was opened with.
+    pub fn epoch_duration(&self) -> u32 {
+        self.indexer.epoch_duration()
     }
 
     /// Return all observations within a sphere across `[start_secs, end_secs]`.
